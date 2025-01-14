@@ -25,7 +25,10 @@ const HOME_ASSISTANT_BOT_ID = "U088Z942Z4H";
 const processedEvents = new Set();
 const DEDUPE_EXPIRATION_MS = 5 * 60 * 1000; // 5 minutes
 
-// Helper to post a message to Slack
+// Track conversation IDs by channel
+const conversationCache = {};
+const CONVERSATION_EXPIRATION_MS = 30 * 60 * 1000; // 30 minutes
+
 async function postToSlack(channel, text) {
   await axios.post(
     "https://slack.com/api/chat.postMessage",
@@ -36,17 +39,23 @@ async function postToSlack(channel, text) {
 
 // Process event in background
 async function processSlackEvent(event) {
-  if (event.user === HOME_ASSISTANT_BOT_ID) {
-    console.log("Ignoring message from Home Assistant bot");
-    return;
-  }
+  if (event.user === HOME_ASSISTANT_BOT_ID) return;
 
   const text = event.text || "";
   const channel = event.channel || "";
-
   if (!text) return;
 
   console.log("Forwarding message to Home Assistant:", text);
+
+  let convId;
+  const now = Date.now();
+
+  if (
+    conversationCache[channel] &&
+    now - conversationCache[channel].lastUsed < CONVERSATION_EXPIRATION_MS
+  ) {
+    convId = conversationCache[channel].id;
+  }
 
   try {
     const haResponse = await axios.post(
@@ -54,7 +63,8 @@ async function processSlackEvent(event) {
       {
         language: "en",
         text,
-        agent_id: "conversation.chatgpt", // Adjust if needed
+        agent_id: "conversation.chatgpt",
+        ...(convId ? { conversation_id: convId } : {}),
       },
       {
         headers: {
@@ -65,6 +75,14 @@ async function processSlackEvent(event) {
     );
 
     console.log("Home Assistant response:", JSON.stringify(haResponse.data));
+
+    const newConvId = haResponse.data.conversation_id;
+    if (newConvId) {
+      conversationCache[channel] = {
+        id: newConvId,
+        lastUsed: now,
+      };
+    }
 
     const resultText =
       haResponse.data.speech ||
@@ -80,22 +98,12 @@ async function processSlackEvent(event) {
 // Main Slack event endpoint
 app.post("/slack/events", async (req, res) => {
   const data = req.body;
-
-  // Handle Slack verification challenge
-  if (data.challenge) {
-    return res.send(data.challenge);
-  }
-
-  // Immediately acknowledge Slack so it won’t retry
+  if (data.challenge) return res.send(data.challenge);
   res.json({ ok: true });
 
-  // Check for event duplication
   const eventId = data.event_id;
   if (!eventId) {
-    // No event_id => nothing to deduplicate, just process
-    if (data.event) {
-      processSlackEvent(data.event);
-    }
+    if (data.event) processSlackEvent(data.event);
     return;
   }
 
@@ -104,19 +112,16 @@ app.post("/slack/events", async (req, res) => {
     return;
   }
 
-  // Mark this event_id as processed
   processedEvents.add(eventId);
   setTimeout(() => {
     processedEvents.delete(eventId);
   }, DEDUPE_EXPIRATION_MS);
 
-  // Process in background
   if (data.event) {
     processSlackEvent(data.event);
   }
 });
 
-// Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
